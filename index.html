@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Event Check-In</title>
+  <style>
+    * { box-sizing:border-box; }
+    body { font-family:-apple-system, 'Segoe UI', Roboto, Arial, sans-serif; background:#f4f4f9; margin:0;
+           padding:10px; display:flex; flex-direction:column; align-items:center; min-height:100vh; }
+    .wrap { width:100%; max-width:420px; }
+    .top { display:flex; align-items:center; justify-content:center; gap:10px; margin-bottom:8px; }
+    h1 { font-size:15px; margin:0; color:#333; font-weight:600; }
+    .btn { padding:7px 16px; font-size:13px; border:none; border-radius:50px; color:#fff; cursor:pointer; }
+    .btn-start { background:#007bff; }
+    .btn-stop { background:#dc3545; }
+    #reader { width:70%; height:200px; margin:0 auto; border-radius:8px; overflow:hidden; background:#000; }
+    video { width:100%; height:100%; object-fit:cover; display:block; }
+    #status { margin-top:8px; padding:22px 12px; border-radius:10px; font-size:22px; font-weight:700;
+              text-align:center; min-height:84px; display:flex; align-items:center; justify-content:center;
+              background:#e5e7eb; color:#555; }
+    #status.loading { background:#e5e7eb; color:#555; font-size:15px; font-weight:500; }
+    #status.success { background:#16a34a; color:#fff; }
+    #status.warning { background:#f59e0b; color:#fff; }
+    #status.error   { background:#dc2626; color:#fff; }
+    #history { margin-top:8px; font-size:12px; color:#444; }
+    #history div { padding:4px 8px; border-radius:5px; margin-bottom:3px; }
+    #history .success { background:#d4edda; }
+    #history .warning { background:#fff3cd; }
+    #history .error   { background:#f8d7da; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <h1>Event Check-In</h1>
+      <button id="startBtn" class="btn btn-start" onclick="startScan()">Start</button>
+      <button id="stopBtn" class="btn btn-stop" onclick="stopScan()" style="display:none;">Stop</button>
+    </div>
+
+    <div id="reader">
+      <video id="video" playsinline muted></video>
+      <canvas id="canvas" style="display:none;"></canvas>
+    </div>
+
+    <div id="status" class="loading">Press Start to open the camera</div>
+    <div id="history"></div>
+  </div>
+
+  <!-- EDIT THIS -->
+  <script>
+    const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbwoQ41j2_dSNoMH0MKPP6OjuJtHuAdGjN2HLcdKMRlgmgRsMTicJo9KOWiFS51t5x7W/exec";
+  </script>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    let stream = null, scanning = false, busy = false;
+    let lastScannedId = null, lastSeenTime = 0, resultShownAt = 0, lastTick = 0;
+
+    const HOLD_MS = 10000;          // keep result on screen at least 10s
+    const GONE_MS = 2000;           // QR missing this long = it was removed
+    const MAX_W = 480;              // downscale frame for faster decoding
+    const SCAN_INTERVAL_MS = 100;   // ~10 scans per second
+    const READY_TEXT = 'Ready. Hold the QR code in view';
+
+    function setStatus(text, cls) {
+      const el = document.getElementById('status');
+      el.textContent = text;
+      el.className = cls || 'loading';
+    }
+
+    function addHistory(text, cls) {
+      const h = document.getElementById('history');
+      const d = document.createElement('div');
+      d.className = cls;
+      d.textContent = new Date().toLocaleTimeString('en-GB') + '  ' + text;
+      h.prepend(d);
+      while (h.children.length > 5) h.removeChild(h.lastChild);
+    }
+
+    function vibrate(status) {
+      if (navigator.vibrate) navigator.vibrate(status === 'success' ? 150 : [100, 60, 100]);
+    }
+
+    async function startScan() {
+      setStatus('Requesting camera access...', 'loading');
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+        video.srcObject = stream;
+        await video.play();
+        document.getElementById('startBtn').style.display = 'none';
+        document.getElementById('stopBtn').style.display = 'inline-block';
+        scanning = true;
+        setStatus(READY_TEXT, 'loading');
+        requestAnimationFrame(tick);
+      } catch (err) {
+        setStatus('Cannot open camera: ' + err.name, 'error');
+      }
+    }
+
+    function stopScan() {
+      scanning = false;
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      document.getElementById('startBtn').style.display = 'inline-block';
+      document.getElementById('stopBtn').style.display = 'none';
+      setStatus('Camera stopped', 'loading');
+    }
+
+    function tick(ts) {
+      if (!scanning) return;
+      requestAnimationFrame(tick);
+      if (busy || ts - lastTick < SCAN_INTERVAL_MS) return;
+      if (video.readyState !== video.HAVE_ENOUGH_DATA) return;
+      lastTick = ts;
+
+      const scale = Math.min(1, MAX_W / video.videoWidth);
+      canvas.width = Math.round(video.videoWidth * scale);
+      canvas.height = Math.round(video.videoHeight * scale);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
+
+      const now = Date.now();
+      if (code && code.data) {
+        if (code.data === lastScannedId) {
+          // Same QR: ignored during HOLD_MS. After that, only re-checked if it left the camera and came back.
+          const wasGone = now - lastSeenTime > GONE_MS;
+          lastSeenTime = now;
+          if (now - resultShownAt > HOLD_MS && wasGone) handleScan(code.data);
+        } else {
+          handleScan(code.data);    // new QR: show its result immediately
+        }
+      } else if (resultShownAt && now - resultShownAt > HOLD_MS && now - lastSeenTime > GONE_MS) {
+        resultShownAt = 0;
+        setStatus(READY_TEXT, 'loading');
+      }
+    }
+
+    async function handleScan(regId) {
+      busy = true;
+      lastScannedId = regId;
+      setStatus('Checking...', 'loading');
+      try {
+        const url = `${WEB_APP_URL}?action=checkin&regId=${encodeURIComponent(regId)}`;
+        const response = await fetch(url);
+        const result = await response.json();
+        setStatus(result.message, result.status);
+        resultShownAt = Date.now();
+        addHistory(result.message, result.status);
+        vibrate(result.status);
+      } catch (err) {
+        setStatus('Error, please scan again: ' + err.message, 'error');
+        lastScannedId = null;
+      } finally {
+        lastSeenTime = Date.now();
+        busy = false;
+      }
+    }
+  </script>
+</body>
+</html>
